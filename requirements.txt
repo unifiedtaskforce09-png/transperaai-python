@@ -1,0 +1,18 @@
+flask 
+werkzeug
+python-docx
+groq
+deep-translator
+# aspose-pdf
+pdf2docx
+googletrans
+# google-generativeai
+google-genai 
+langdetect
+python-dotenv
+fastapi
+uvicorn
+python-multipart
+pydantic
+fastapi
+uvicorn
