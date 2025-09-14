@@ -93,6 +93,10 @@ class TranslationProgress:
 def health():
     return {"status": "ok"}
 
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
 
 @app.post("/translate")
 async def translate(
@@ -327,7 +331,7 @@ cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
 cleanup_thread.start()
 
 
-# Run with: uvicorn fastapi_app:app --host 0.0.0.0 --port 8000
+# Run with: uvicorn main:app --host 0.0.0.0 --port 8000
 
 
 
