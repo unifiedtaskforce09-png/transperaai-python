@@ -1,14 +1,8 @@
 python-docx
-groq
-deep-translator
 pdf2docx
-googletrans
-google-genai 
-langdetect
+google-generativeai
 python-dotenv
 fastapi
 uvicorn
 python-multipart
 pydantic
-
-

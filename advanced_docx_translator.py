@@ -21,14 +21,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # Optional external client classes (lazy-resolved)
-GroqClient = None
 GeminiClient = None
-try:
-    from groq_setup import GroqClient as _GroqClient  # type: ignore
-    GroqClient = _GroqClient
-except Exception:
-    GroqClient = None
-
 try:
     from gemini_setup import GeminiClient as _GeminiClient  # type: ignore
     GeminiClient = _GeminiClient
@@ -36,7 +29,6 @@ except Exception:
     GeminiClient = None
 
 # Client instances (lazy)
-groq_client = None
 gemini_client = None
 
 # ------------------------------
@@ -1252,15 +1244,11 @@ def create_smart_chunks(items: List[Dict[str, Any]], doc: Document, max_chars: i
     return final_chunks
 
 def check_api_keys() -> Dict[str, bool]:
-    groq_key = os.environ.get("GROQ_API_KEY") or os.environ.get("GROQ_KEY")
     gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not groq_key and not gemini_key:
-        raise RuntimeError("No API keys found. Set GROQ_API_KEY or GEMINI_API_KEY environment variables.")
-    if groq_key:
-        logger.info("Groq API key found")
-    if gemini_key:
-        logger.info("Gemini API key found")
-    return {"groq": bool(groq_key), "gemini": bool(gemini_key)}
+    if not gemini_key:
+        raise RuntimeError("No API key found. Set GEMINI_API_KEY or GOOGLE_API_KEY environment variables.")
+    logger.info("Gemini API key found")
+    return {"gemini": bool(gemini_key)}
 
 def _make_cache_key(engine: str, model_name: str, temperature: float, target_language: str, items: List[Dict[str, Any]]) -> str:
     try:
@@ -1305,29 +1293,20 @@ def _extract_json_from_text(output_text: str) -> Optional[Any]:
     return None
 
 def _ensure_client(engine: str):
-    global groq_client, gemini_client
-    if engine.lower() == 'groq':
-        if groq_client is None:
-            if GroqClient is None:
-                raise RuntimeError("GroqClient not available.")
-            groq_client = GroqClient()
-            try:
-                groq_client.set_model("llama-3.3-70b-versatile")
-            except Exception:
-                pass
-        return groq_client, getattr(groq_client, 'model_name', 'groq-default')
-    elif engine.lower() == 'gemini':
-        if gemini_client is None:
-            if GeminiClient is None:
-                raise RuntimeError("GeminiClient not available.")
-            gemini_client = GeminiClient()
-            try:
-                gemini_client.set_model("gemini-2.5-flash-lite")
-            except Exception:
-                pass
-        return gemini_client, getattr(gemini_client, 'model_name', 'gemini-default')
-    else:
+    global gemini_client
+    # Gracefully map any 'groq' request to gemini
+    normalized = (engine or 'gemini').lower()
+    if normalized not in ('gemini', 'groq'):
         raise ValueError(f"Unsupported engine: {engine}.")
+    if gemini_client is None:
+        if GeminiClient is None:
+            raise RuntimeError("GeminiClient not available.")
+        gemini_client = GeminiClient()
+        try:
+            gemini_client.set_model("gemini-2.5-flash-lite")
+        except Exception:
+            pass
+    return gemini_client, getattr(gemini_client, 'model_name', 'gemini-default')
 
 def _invoke_model(client, payload: str, system_prompt: str, temperature: float) -> str:
     tried = []
@@ -1369,7 +1348,7 @@ def _invoke_model(client, payload: str, system_prompt: str, temperature: float) 
         logger.debug("Model invocation tried methods: %s", tried)
         raise RuntimeError(f"Failed to invoke model client. Tried: {tried}")
 
-def translate_text_json(items: List[Dict[str, str]], engine: str = 'groq', target_language: str = 'hi', temperature: float = 0.7, max_chars_per_chunk: int = 8000, doc: Optional[Document] = None) -> Dict[str, str]:
+def translate_text_json(items: List[Dict[str, str]], engine: str = 'gemini', target_language: str = 'hi', temperature: float = 0.7, max_chars_per_chunk: int = 8000, doc: Optional[Document] = None) -> Dict[str, str]:
     if not isinstance(items, list) or not items:
         return {}
 
@@ -1678,7 +1657,7 @@ def preserve_images(input_path: str, output_path: str):
 
 def translate_docx_advanced(input_path: str, output_path: str,
                             target_language: str = 'hi',
-                            engine: str = 'groq',
+                            engine: str = 'gemini',
                             tone: str = 'professional',
                             progress_callback=None,
                             max_chars_per_chunk: int = 6000) -> Optional[Dict[str, int]]:
@@ -1689,8 +1668,9 @@ def translate_docx_advanced(input_path: str, output_path: str,
     
     try:
         available_keys = check_api_keys()
-        if not available_keys.get(engine.lower(), False):
-            raise RuntimeError(f"No API key available for {engine}.")
+        # We only rely on Gemini now; map any engine to gemini availability
+        if not available_keys.get('gemini', False):
+            raise RuntimeError("No API key available for gemini.")
     except Exception as e:
         logger.error(f"API key check failed: {e}")
         return None
@@ -1711,7 +1691,8 @@ def translate_docx_advanced(input_path: str, output_path: str,
         return {"total_paragraphs": 0}
 
     try:
-        translated_map = translate_text_json(items, engine=engine, target_language=target_language, temperature=0.5, max_chars_per_chunk=max_chars_per_chunk, doc=doc)
+        # Gracefully map any engine (including 'groq') to gemini-backed translation
+        translated_map = translate_text_json(items, engine='gemini', target_language=target_language, temperature=0.5, max_chars_per_chunk=max_chars_per_chunk, doc=doc)
     except Exception as e:
         logger.error(f"Translation failed: {e}. Falling back to original texts for all items.")
         translated_map = {it['id']: it['text'] for it in items}
