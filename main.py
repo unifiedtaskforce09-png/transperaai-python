@@ -106,7 +106,9 @@ async def translate(
     generateSummary: Optional[bool] = Form(False),
     firstPageOnly: Optional[bool] = Form(False),
     tone: str = Form('professional'),
-    pdfEngine: str = Form('pdf2docx')
+    pdfEngine: str = Form('pdf2docx'),
+    max_total_chars: Optional[str] = Form(None)
+
 ):
     # Validate file type and size
     if file is None or file.filename == "":
@@ -209,6 +211,10 @@ async def translate(
 
         def run_translation():
             nonlocal translation_complete, translation_error
+           
+           
+      
+            print(type(max_total_chars))
             try:
                 result = translate_docx_advanced(
                     docx_file_to_process,
@@ -216,7 +222,8 @@ async def translate(
                     engine=engine.lower(),
                     target_language=targetLang,
                     progress_callback=update_progress_callback,
-                    tone=tone
+                    tone=tone,
+                    max_total_chars=5000
                 )
                 if result:
                     shutil.copy2(output_path, download_path)

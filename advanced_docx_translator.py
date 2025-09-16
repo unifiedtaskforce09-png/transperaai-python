@@ -21,7 +21,14 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # Optional external client classes (lazy-resolved)
+GroqClient = None
 GeminiClient = None
+try:
+    from groq_setup import GroqClient as _GroqClient  # type: ignore
+    GroqClient = _GroqClient
+except Exception:
+    GroqClient = None
+
 try:
     from gemini_setup import GeminiClient as _GeminiClient  # type: ignore
     GeminiClient = _GeminiClient
@@ -29,6 +36,7 @@ except Exception:
     GeminiClient = None
 
 # Client instances (lazy)
+groq_client = None
 gemini_client = None
 
 # ------------------------------
@@ -68,9 +76,7 @@ _TOKEN_PATTERNS = [
     (re.compile(r'\b\d{1,2}/\d{1,2}/\d{2,4}\b'), 'DATE'),
     (re.compile(r'\b\d{1,2}-\d{1,2}-\d{2,4}\b'), 'DATE'),
     
-    # Acronyms and codes (more specific patterns)
-    (re.compile(r'\b[A-Z]{2,5}\b(?!\w)'), 'ACRONYM'),  # 2-5 char acronyms
-    (re.compile(r'\b[A-Z][a-z]{0,1}[A-Z]+\b'), 'ACRONYM'),  # CamelCase acronyms
+    # Removed acronym/abbreviation protection to allow full translation
     
     # Version numbers
     (re.compile(r'\b\d+\.\d+(?:\.\d+)*(?:-[a-zA-Z0-9]+)?\b'), 'VERSION'),
@@ -132,22 +138,13 @@ def protect_tokens(text: str, skip_tags: Optional[set] = None) -> tuple[str, Dic
         if len(token) <= 2 and not any(c.isdigit() for c in token):
             return token
             
-        # Special handling for acronyms
-        if tag == 'ACRONYM':
-            # Don't protect common English words in caps
-            common_words = {'THE', 'AND', 'OR', 'IN', 'ON', 'AT', 'TO', 'BY', 'UP', 'OF'}
-            if token in common_words:
-                return token
-            # Don't protect single letters
-            if len(token) == 1:
-                return token
-                
         key = f"<{tag}_{counter}>"  # More translation-friendly format
         placeholders[key] = token
         counter += 1
         return key
 
     # First protect exact matches that should never be translated
+    # Removed ABBR-related exact matches so they can be translated
     exact_matches = {
         'Mr.': 'TITLE',
         'Mrs.': 'TITLE',
@@ -155,13 +152,12 @@ def protect_tokens(text: str, skip_tags: Optional[set] = None) -> tuple[str, Dic
         'Prof.': 'TITLE',
         'Sr.': 'TITLE',
         'Jr.': 'TITLE',
-        'vs.': 'ABBR',
-        'etc.': 'ABBR',
-        'i.e.': 'ABBR',
-        'e.g.': 'ABBR',
     }
     
     for exact, tag in exact_matches.items():
+        # Respect skip_tags for exact matches as well
+        if skip_tags and tag in skip_tags:
+            continue
         if exact in protected:
             key = f"<{tag}_{counter}>"
             placeholders[key] = exact
@@ -183,6 +179,39 @@ def restore_tokens(text: str, placeholders: Dict[str, str]) -> str:
     for k in sorted(placeholders.keys(), key=len, reverse=True):
         text = text.replace(k, placeholders[k])
     return text
+
+# ------------------------------
+# Numeric localization helpers
+# ------------------------------
+def localize_digits(text: str, target_language: Optional[str]) -> str:
+    if not text or not target_language:
+        return text
+    lang = str(target_language).lower()
+    try:
+        if lang.startswith('hi'):
+            # Devanagari digits
+            mapping = str.maketrans('0123456789', '०१२३४५६७८९')
+            return text.translate(mapping)
+        elif lang.startswith('ar') and not lang.startswith('ar-'):  # generic Arabic
+            mapping = str.maketrans('0123456789', '٠١٢٣٤٥٦٧٨٩')
+            return text.translate(mapping)
+    except Exception:
+        pass
+    return text
+
+def localize_digits_outside_placeholders(text: str, target_language: Optional[str]) -> str:
+    if not text:
+        return text
+    # Placeholders are of the form <TAG_n>
+    pattern = re.compile(r'(<[A-Z]+_\d+>)')
+    try:
+        segments = pattern.split(text)
+        for i, seg in enumerate(segments):
+            if not pattern.fullmatch(seg):
+                segments[i] = localize_digits(seg, target_language)
+        return ''.join(segments)
+    except Exception:
+        return localize_digits(text, target_language)
 
 # ------------------------------
 # XML helpers and formatting preservation
@@ -878,28 +907,33 @@ def _segment_paragraph_items(p_elem, use_local_names: bool = False) -> List[Dict
             current_t_nodes = []; current_r_nodes = []
             current_key_id = None
 
+        def _localname(tag: str) -> str:
+            return tag.split('}', 1)[-1] if '}' in tag else tag
+
         for r in r_nodes_all:
             anc = r.xpath(hyperlink_anc_xpath, namespaces=_NS) if not use_local_names else r.xpath(hyperlink_anc_xpath)
             key_elem = anc[0] if anc else None
             key_id = id(key_elem) if key_elem is not None else None
-            t_nodes_in_run = r.xpath(t_in_run_xpath, namespaces=_NS) if not use_local_names else r.xpath(t_in_run_xpath)
-            has_break = bool(r.xpath(br_in_run_xpath, namespaces=_NS) if not use_local_names else r.xpath(br_in_run_xpath))
-
-            # Only finalize on explicit break (br/tab)
-            if current_t_nodes and has_break:
-                current_t_nodes.extend(t_nodes_in_run)
-                current_r_nodes.append(r)
-                _finalize_current()
-                continue
 
             # Keep hyperlink spans atomic: finalize when hyperlink ancestor changes
             if current_t_nodes and (current_key_id is not None and key_id is not None and key_id != current_key_id):
                 _finalize_current()
 
-            if t_nodes_in_run:
-                current_t_nodes.extend(t_nodes_in_run)
-                current_r_nodes.append(r)
-                current_key_id = key_id
+            # Iterate run children to split exactly at tabs/breaks
+            for child in list(r):
+                lname = _localname(child.tag)
+                if lname == 't':
+                    current_t_nodes.append(child)
+                    current_r_nodes.append(r)
+                    current_key_id = key_id
+                elif lname in ('br', 'tab'):
+                    if current_t_nodes:
+                        _finalize_current()
+                    # After a break, continue collecting further text in the same run as a new segment
+                    current_key_id = key_id
+                else:
+                    # ignore other child types
+                    continue
 
         _finalize_current()
         return segments
@@ -965,7 +999,7 @@ def collect_text_items_all_parts(doc: Document) -> List[Dict[str, Any]]:
                     style_val = _extract_style_value(p)
                     segs = _segment_paragraph_items(p, use_local_names=False)
                     for seg in segs:
-                        items.append({'id': f'P{idx}', 'text': seg['text'], 'style': style_val or '', 'part': part, 'para': p, 't_nodes': seg['t_nodes'], 'r_nodes': seg['r_nodes']})
+                        items.append({'id': f'P{idx}', 'text': seg['text'], 'style': style_val or '', 'part': part, 'para': p, 't_nodes': seg['t_nodes'], 'r_nodes': seg['r_nodes'], 't_space_flags': seg.get('t_space_flags', [])})
                         idx += 1
                 if matches:
                     found_in_part += len(matches)
@@ -980,7 +1014,7 @@ def collect_text_items_all_parts(doc: Document) -> List[Dict[str, Any]]:
                         style_val = _extract_style_value(p)
                         segs = _segment_paragraph_items(p, use_local_names=True)
                         for seg in segs:
-                            items.append({'id': f'P{idx}', 'text': seg['text'], 'style': style_val or '', 'part': part, 'para': p, 't_nodes': seg['t_nodes'], 'r_nodes': seg['r_nodes']})
+                            items.append({'id': f'P{idx}', 'text': seg['text'], 'style': style_val or '', 'part': part, 'para': p, 't_nodes': seg['t_nodes'], 'r_nodes': seg['r_nodes'], 't_space_flags': seg.get('t_space_flags', [])})
                             idx += 1
                     if matches:
                         found_in_part += len(matches)
@@ -1007,7 +1041,7 @@ def collect_text_items_all_parts(doc: Document) -> List[Dict[str, Any]]:
                     style_val = None
                 segs = _segment_paragraph_items(p_elem, use_local_names=False)
                 for seg in segs:
-                    items.append({'id': f'P{idx}', 'text': seg['text'], 'style': style_val or '', 'part': getattr(container, 'part', None), 'para': p_elem, 't_nodes': seg['t_nodes'], 'r_nodes': seg['r_nodes']})
+                    items.append({'id': f'P{idx}', 'text': seg['text'], 'style': style_val or '', 'part': getattr(container, 'part', None), 'para': p_elem, 't_nodes': seg['t_nodes'], 'r_nodes': seg['r_nodes'], 't_space_flags': seg.get('t_space_flags', [])})
                     idx += 1
             for table in getattr(container, 'tables', []):
                 for row in table.rows:
@@ -1244,11 +1278,15 @@ def create_smart_chunks(items: List[Dict[str, Any]], doc: Document, max_chars: i
     return final_chunks
 
 def check_api_keys() -> Dict[str, bool]:
+    groq_key = os.environ.get("GROQ_API_KEY") or os.environ.get("GROQ_KEY")
     gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not gemini_key:
-        raise RuntimeError("No API key found. Set GEMINI_API_KEY or GOOGLE_API_KEY environment variables.")
-    logger.info("Gemini API key found")
-    return {"gemini": bool(gemini_key)}
+    if not groq_key and not gemini_key:
+        raise RuntimeError("No API keys found. Set GROQ_API_KEY or GEMINI_API_KEY environment variables.")
+    if groq_key:
+        logger.info("Groq API key found")
+    if gemini_key:
+        logger.info("Gemini API key found")
+    return {"groq": bool(groq_key), "gemini": bool(gemini_key)}
 
 def _make_cache_key(engine: str, model_name: str, temperature: float, target_language: str, items: List[Dict[str, Any]]) -> str:
     try:
@@ -1293,20 +1331,29 @@ def _extract_json_from_text(output_text: str) -> Optional[Any]:
     return None
 
 def _ensure_client(engine: str):
-    global gemini_client
-    # Gracefully map any 'groq' request to gemini
-    normalized = (engine or 'gemini').lower()
-    if normalized not in ('gemini', 'groq'):
+    global groq_client, gemini_client
+    if engine.lower() == 'groq':
+        if groq_client is None:
+            if GroqClient is None:
+                raise RuntimeError("GroqClient not available.")
+            groq_client = GroqClient()
+            try:
+                groq_client.set_model("llama-3.3-70b-versatile")
+            except Exception:
+                pass
+        return groq_client, getattr(groq_client, 'model_name', 'groq-default')
+    elif engine.lower() == 'gemini':
+        if gemini_client is None:
+            if GeminiClient is None:
+                raise RuntimeError("GeminiClient not available.")
+            gemini_client = GeminiClient()
+            try:
+                gemini_client.set_model("gemini-2.5-flash-lite")
+            except Exception:
+                pass
+        return gemini_client, getattr(gemini_client, 'model_name', 'gemini-default')
+    else:
         raise ValueError(f"Unsupported engine: {engine}.")
-    if gemini_client is None:
-        if GeminiClient is None:
-            raise RuntimeError("GeminiClient not available.")
-        gemini_client = GeminiClient()
-        try:
-            gemini_client.set_model("gemini-2.5-flash-lite")
-        except Exception:
-            pass
-    return gemini_client, getattr(gemini_client, 'model_name', 'gemini-default')
 
 def _invoke_model(client, payload: str, system_prompt: str, temperature: float) -> str:
     tried = []
@@ -1348,7 +1395,7 @@ def _invoke_model(client, payload: str, system_prompt: str, temperature: float) 
         logger.debug("Model invocation tried methods: %s", tried)
         raise RuntimeError(f"Failed to invoke model client. Tried: {tried}")
 
-def translate_text_json(items: List[Dict[str, str]], engine: str = 'gemini', target_language: str = 'hi', temperature: float = 0.7, max_chars_per_chunk: int = 8000, doc: Optional[Document] = None) -> Dict[str, str]:
+def translate_text_json(items: List[Dict[str, str]], engine: str = 'groq', target_language: str = 'hi', temperature: float = 0.7, max_chars_per_chunk: int = 8000, doc: Optional[Document] = None) -> Dict[str, str]:
     if not isinstance(items, list) or not items:
         return {}
 
@@ -1366,8 +1413,8 @@ def translate_text_json(items: List[Dict[str, str]], engine: str = 'gemini', tar
             protected_items.append({'id': it['id'], 'text': ''})
             placeholders_map[it['id']] = {}
             continue
-        # Skip acronym protection for headings to ensure headings translate fully
-        skip_tags = {'ACRONYM'} if is_heading_item(it, heading_style_names) else None
+        # Do not protect acronyms/abbreviations; only optionally skip numbers-in-units in headings
+        skip_tags = {'NUMUNIT'} if is_heading_item(it, heading_style_names) else set()
         p, ph = protect_tokens(txt, skip_tags=skip_tags)
         new_it = {'id': it['id'], 'text': p}
         if 'style' in it:
@@ -1407,10 +1454,13 @@ def translate_text_json(items: List[Dict[str, str]], engine: str = 'gemini', tar
             - Do not add or remove necessary spaces; keep single spaces where present.
             - Do not insert spaces inside words or before punctuation.
             - The numbers should also be translated into {target_language} numbering format. 
-            - Keep placeholders exactly as-is (e.g., <ACRONYM_0>) without extra spaces around them.
+            - Keep placeholders exactly as-is (e.g., <URL_0>) without extra spaces around them.
             HINDI:
             - Do not insert spaces between Devanagari letters; natural punctuation spacing only.
-            OTHER:
+            ACRONYMS/ABBREVIATIONS:
+            - Translate acronyms and abbreviations; preserve original casing.
+            - Do not add periods to acronyms unless present in the source.
+    
             - Do NOT summarize or rewrite; translate fully. Preserve punctuation, capitalization (ALL CAPS headings), bullets, numbering, symbols, and layout cues.
             FOLLOW THESE INSTRUCTIONS CAREFULLY AND STRICTLY.
             """
@@ -1449,7 +1499,9 @@ def translate_text_json(items: List[Dict[str, str]], engine: str = 'gemini', tar
                 final_map: Dict[str, str] = {}
                 for k in in_ids_ordered:
                     v = out_map_raw.get(k, next((it['text'] for it in batch if it['id'] == k), ''))
-                    restored = restore_tokens(v, placeholders_map.get(k, {}))
+                    # Localize digits before restoring tokens to avoid touching placeholders
+                    localized = localize_digits_outside_placeholders(v, target_language)
+                    restored = restore_tokens(localized, placeholders_map.get(k, {}))
                     final_map[k] = restored
                 set_cached_translation(cache_key, final_map)
                 return final_map
@@ -1605,9 +1657,11 @@ def apply_translation_to_item(item: Dict[str, Any], translated_text: str, target
                 t_node.text = ptext
                 ensure_textnode_preserve_space(t_node)
                 
-                # Apply run formatting if available
+                # Apply run formatting if available. If segmenting split a run, fallback to first run's format.
                 if i < len(r_nodes) and i < len(run_formats):
                     apply_run_formatting(r_nodes[i], run_formats[i])
+                elif r_nodes and run_formats:
+                    apply_run_formatting(r_nodes[min(i, len(r_nodes)-1)], run_formats[0])
                 
             # Clear any remaining nodes
             if len(parts) < len(t_nodes):
@@ -1625,7 +1679,7 @@ def apply_translation_to_item(item: Dict[str, Any], translated_text: str, target
             if r_nodes and run_formats:
                 apply_run_formatting(r_nodes[0], run_formats[0])
                 
-            # Clear remaining nodes
+            # Clear remaining nodes and enforce a single space between segments if the next segment starts without leading space
             for t in t_nodes[1:]:
                 t.text = ''
         
@@ -1657,10 +1711,11 @@ def preserve_images(input_path: str, output_path: str):
 
 def translate_docx_advanced(input_path: str, output_path: str,
                             target_language: str = 'hi',
-                            engine: str = 'gemini',
+                            engine: str = 'groq',
                             tone: str = 'professional',
                             progress_callback=None,
-                            max_chars_per_chunk: int = 6000) -> Optional[Dict[str, int]]:
+                            max_chars_per_chunk: int = 6000,
+                            max_total_chars: Optional[int] = 5000) -> Optional[Dict[str, int]]:
     logger.info(f"Translating {input_path} -> {output_path} ({target_language}, {engine})")
     
     if not preserve_images(input_path, output_path):
@@ -1668,9 +1723,8 @@ def translate_docx_advanced(input_path: str, output_path: str,
     
     try:
         available_keys = check_api_keys()
-        # We only rely on Gemini now; map any engine to gemini availability
-        if not available_keys.get('gemini', False):
-            raise RuntimeError("No API key available for gemini.")
+        if not available_keys.get(engine.lower(), False):
+            raise RuntimeError(f"No API key available for {engine}.")
     except Exception as e:
         logger.error(f"API key check failed: {e}")
         return None
@@ -1679,11 +1733,48 @@ def translate_docx_advanced(input_path: str, output_path: str,
     items = collect_text_items_all_parts(doc)
     # Compute heading styles once and reuse
     heading_style_names = detect_heading_styles(doc)
-    total_items = len(items)
-    logger.info(f"Collected {total_items} translatable text items from document parts.")
+
+    # Apply global character limit across concatenated item texts
+    limited_items: List[Dict[str, Any]] = []
+    limited_ids: set = set()
+    if max_total_chars is not None and max_total_chars >= 0:
+        consumed = 0
+        for it in items:
+            if consumed >= max_total_chars:
+                break
+            txt = (it.get('text') or '')
+            remain = max_total_chars - consumed
+            if len(txt) <= remain:
+                limited_items.append(it)
+                limited_ids.add(it.get('id'))
+                consumed += len(txt)
+            else:
+                # Truncate this item and stop
+                clone = {k: (v.copy() if isinstance(v, list) else v) for k, v in it.items()}
+                clone['text'] = txt[:remain]
+                limited_items.append(clone)
+                limited_ids.add(it.get('id'))
+                consumed += remain
+                break
+    else:
+        limited_items = items
+        limited_ids = {it.get('id') for it in items}
+
+    # Clear all text for items beyond the limit (not in limited_ids)
+    if limited_items is not items:
+        for it in items:
+            if it.get('id') not in limited_ids:
+                for t in (it.get('t_nodes') or []):
+                    try:
+                        t.text = ''
+                    except Exception:
+                        continue
+
+    total_items = len(limited_items)
+    logger.info(f"Collected {len(items)} items; after char limit -> {total_items} items for translation.")
     
     if total_items > 0 and logger.isEnabledFor(logging.DEBUG):
-        preview = [(it['id'], (it['text'] or '')[:120]) for it in items[:10]]
+        preview = [(it['id'], (it['text'] or '')[:120]) for it in limited_items[:10]]
         logger.debug(f"Items preview (first 10): {preview}")
 
     if total_items == 0:
@@ -1691,15 +1782,14 @@ def translate_docx_advanced(input_path: str, output_path: str,
         return {"total_paragraphs": 0}
 
     try:
-        # Gracefully map any engine (including 'groq') to gemini-backed translation
-        translated_map = translate_text_json(items, engine='gemini', target_language=target_language, temperature=0.5, max_chars_per_chunk=max_chars_per_chunk, doc=doc)
+        translated_map = translate_text_json(limited_items, engine=engine, target_language=target_language, temperature=0.5, max_chars_per_chunk=max_chars_per_chunk, doc=doc)
     except Exception as e:
         logger.error(f"Translation failed: {e}. Falling back to original texts for all items.")
-        translated_map = {it['id']: it['text'] for it in items}
+        translated_map = {it['id']: it['text'] for it in limited_items}
 
     processed = 0
     id_to_item = {it['id']: it for it in items}
-    for it in items:
+    for it in limited_items:
         id_ = it['id']
         translated_text = translated_map.get(id_, it['text'])
         item = id_to_item.get(id_)
